@@ -20,50 +20,37 @@ from app.agents.routing import (
 
 
 def build_factory_graph(checkpointer=None):
-    """
-    Build and compile the Factory Inspector workflow.
-
-    InMemorySaver supports local development and resumable
-    human approval. Use persistent storage for production.
-    """
+    """Build and compile the Factory Inspector workflow."""
     if checkpointer is None:
         checkpointer = InMemorySaver()
 
     workflow = StateGraph(FactoryAgentState)
 
-    # Register workflow nodes.
+    # Register nodes.
     workflow.add_node("acquire_data", nodes.acquire_data)
     workflow.add_node("analyze_sensors", nodes.analyze_sensors)
     workflow.add_node("inspect_image", nodes.inspect_image)
+    workflow.add_node("identify_equipment", nodes.identify_equipment)
     workflow.add_node("triage_incident", nodes.triage_incident)
-    workflow.add_node(
-        "log_normal_operation",
-        nodes.log_normal_operation,
-    )
+    workflow.add_node("log_normal_operation", nodes.log_normal_operation)
     workflow.add_node("create_incident", nodes.create_incident)
-    workflow.add_node(
-        "investigate_incident",
-        nodes.investigate_incident,
-    )
+    workflow.add_node("investigate_incident", nodes.investigate_incident)
     workflow.add_node(
         "generate_maintenance_task",
         nodes.generate_maintenance_task,
     )
     workflow.add_node("human_approval", nodes.process_approval)
     workflow.add_node("start_maintenance", nodes.start_maintenance)
-    workflow.add_node(
-        "complete_maintenance",
-        nodes.complete_maintenance,
-    )
+    workflow.add_node("complete_maintenance", nodes.complete_maintenance)
     workflow.add_node("verify_maintenance", nodes.verify_maintenance)
     workflow.add_node("close_incident", nodes.close_incident)
     workflow.add_node("escalate_incident", nodes.escalate_incident)
     workflow.add_node("handle_error", nodes.handle_error)
 
-    # Start the workflow.
+    # Start.
     workflow.add_edge(START, "acquire_data")
 
-    # Validate and analyze the incoming data.
+    # Acquire and validate incoming data.
     workflow.add_conditional_edges(
         "acquire_data",
         route_after_acquisition,
@@ -73,6 +60,7 @@ def build_factory_graph(checkpointer=None):
         },
     )
 
+    # Analyze sensors.
     workflow.add_conditional_edges(
         "analyze_sensors",
         route_after_sensor_analysis,
@@ -82,16 +70,19 @@ def build_factory_graph(checkpointer=None):
         },
     )
 
+    # Inspect the image, then identify the equipment.
     workflow.add_conditional_edges(
         "inspect_image",
         route_after_image_inspection,
         {
-            "triage_incident": "triage_incident",
+            "triage_incident": "identify_equipment",
             "error": "handle_error",
         },
     )
 
-    # Decide whether an incident needs to be created.
+    workflow.add_edge("identify_equipment", "triage_incident")
+
+    # Triage findings.
     workflow.add_conditional_edges(
         "triage_incident",
         route_after_triage,
@@ -104,7 +95,7 @@ def build_factory_graph(checkpointer=None):
 
     workflow.add_edge("log_normal_operation", END)
 
-    # Investigate incidents and propose maintenance.
+    # Create and investigate incidents.
     workflow.add_conditional_edges(
         "create_incident",
         route_after_incident_creation,
@@ -123,6 +114,7 @@ def build_factory_graph(checkpointer=None):
         },
     )
 
+    # Generate a maintenance task.
     workflow.add_conditional_edges(
         "generate_maintenance_task",
         route_after_task_creation,
@@ -132,7 +124,7 @@ def build_factory_graph(checkpointer=None):
         },
     )
 
-    # The approval node pauses using interrupt().
+    # Require human approval before maintenance.
     workflow.add_conditional_edges(
         "human_approval",
         route_after_approval,
@@ -144,7 +136,7 @@ def build_factory_graph(checkpointer=None):
         },
     )
 
-    # Execute the simulated maintenance workflow.
+    # Simulate maintenance.
     workflow.add_conditional_edges(
         "start_maintenance",
         route_after_maintenance_start,
@@ -163,7 +155,7 @@ def build_factory_graph(checkpointer=None):
         },
     )
 
-    # Verify the result before resolving or escalating.
+    # Verify maintenance before closing or escalating.
     workflow.add_conditional_edges(
         "verify_maintenance",
         route_after_verification,

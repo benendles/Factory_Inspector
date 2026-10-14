@@ -8,3 +8,7 @@ langgraph
 httpx
 pytest
 python-multipart
+pytesseract
+Pillow
+psycopg[binary]>=3.3.6
+SQLAlchemy>=2.1.4
