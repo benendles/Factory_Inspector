@@ -1,4 +1,5 @@
 from langgraph.types import Command
+from uuid import uuid4
 
 from app.agents.graph import build_factory_graph
 
@@ -21,13 +22,7 @@ def test_approved_maintenance_and_verification():
             "pressure_bar": 5.0,
             "moisture_percent": 40.0,
         },
-        "post_maintenance_readings": {
-            "machine_id": "MACHINE-003",
-            "temperature_c": 45.0,
-            "vibration_mm_s": 2.0,
-            "pressure_bar": 5.0,
-            "moisture_percent": 40.0,
-        },
+        "simulation_scenario_id": "overheating",
     }
 
     print("\n--- Starting Approval Workflow ---")
@@ -54,6 +49,29 @@ def test_approved_maintenance_and_verification():
 
     assert result.get("approval_status") == "pending", (
         "Approval should initially be pending."
+    )
+
+    # Simulate the checkpoint state that the trusted identity-verification
+    # endpoint writes after it has persisted an audit record. Direct graph
+    # tests must not bypass the maintenance identity gate.
+    registry_id = str(uuid4())
+    graph.update_state(
+        config,
+        {
+            "physical_identity_confirmed": True,
+            "physical_verification_required": False,
+            "registry_requires_physical_verification": False,
+            "physical_identity_verified_registry_id": registry_id,
+            "physical_identity_verification_audit_id": str(uuid4()),
+            "physical_identity_verification_decision": "confirmed",
+            "registry_match_status": "verified_match",
+            "registry_match": {
+                "status": "verified_match",
+                "candidate": {"id": registry_id},
+            },
+            "equipment_identifier_conflicts": [],
+            "identifier_conflicts": [],
+        },
     )
 
     print("\n--- Approving Maintenance ---")
@@ -94,6 +112,13 @@ def test_approved_maintenance_and_verification():
 
     assert result.get("resolved") is True, (
         "The incident should resolve after successful verification."
+    )
+
+    assert result["post_maintenance_readings"]["temperature_c"] == 55.0
+    assert result["post_maintenance_readings"]["simulated"] is True
+    assert result["incident"]["status"] == "resolved"
+    assert result["investigation"]["incident_details"]["status"] == (
+        "resolved"
     )
 
     print(

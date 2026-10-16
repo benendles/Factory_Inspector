@@ -268,6 +268,64 @@ class MaintenanceService:
 
         return self._tasks.get(task_id)
 
+    def restore_task(self, payload: dict[str, object]) -> MaintenanceTask:
+        """Rehydrate a checkpointed task without bypassing status rules."""
+
+        task_id = str(payload.get("task_id") or "")
+        if not task_id:
+            raise ValueError("Cannot restore a maintenance task without task_id.")
+
+        existing = self._tasks.get(task_id)
+        if existing is not None:
+            return existing
+
+        try:
+            task_status = MaintenanceStatus(
+                str(payload.get("status") or MaintenanceStatus.PENDING_APPROVAL.value)
+            )
+        except ValueError as exc:
+            raise ValueError("Checkpointed task has an invalid status.") from exc
+
+        recommendations: list[MaintenanceRecommendation] = []
+        raw_recommendations = payload.get("recommended_actions") or []
+        if not isinstance(raw_recommendations, list):
+            raise ValueError("Checkpointed task recommendations must be a list.")
+
+        for item in raw_recommendations:
+            if not isinstance(item, dict):
+                continue
+            action = item.get("action")
+            if not isinstance(action, str) or not action:
+                continue
+            recommendations.append(
+                MaintenanceRecommendation(
+                    action=action,
+                    reason=str(item.get("reason") or action),
+                    priority=str(item.get("priority") or "medium"),
+                    requires_qualified_technician=bool(
+                        item.get("requires_qualified_technician", True)
+                    ),
+                )
+            )
+
+        task = MaintenanceTask(
+            task_id=task_id,
+            incident_id=str(payload.get("incident_id") or ""),
+            machine_id=str(payload.get("machine_id") or ""),
+            title=str(payload.get("title") or "Maintenance investigation"),
+            problem=str(payload.get("problem") or ""),
+            severity=str(payload.get("severity") or "medium"),
+            recommended_actions=recommendations,
+            status=task_status,
+            requires_human_approval=bool(
+                payload.get("requires_human_approval", True)
+            ),
+            created_at=str(payload.get("created_at") or datetime.now(timezone.utc).isoformat()),
+            updated_at=str(payload.get("updated_at") or datetime.now(timezone.utc).isoformat()),
+        )
+        self._tasks[task_id] = task
+        return task
+
     def list_tasks(self) -> list[MaintenanceTask]:
         """Return maintenance tasks, newest first."""
 

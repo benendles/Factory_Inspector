@@ -1,6 +1,7 @@
 """LangGraph nodes for the Factory Inspector AI workflow."""
 
 from pathlib import Path
+import asyncio
 from datetime import datetime, timezone
 from dataclasses import asdict, is_dataclass
 from enum import Enum
@@ -29,6 +30,11 @@ from app.services.verification_service import (
     VerificationService,
     VerificationOutcome,
 )
+from app.services.evolus_client import (
+    EvolusClient,
+    EvolusConfigurationError,
+)
+from app.services.workflow_artifact_store import WorkflowArtifactStore
 
 from app.database.session import SessionLocal
 from app.services.sql_equipment_matcher import SQLEquipmentMatcher
@@ -45,6 +51,7 @@ nameplate_ocr_service = NameplateOCRService()
 incident_service = IncidentService()
 maintenance_service = MaintenanceService()
 verification_service = VerificationService()
+workflow_artifact_store = WorkflowArtifactStore()
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +301,124 @@ def _build_registry_candidate(visual_data, ocr_data):
     }
 
 
+def _build_evidence_reconciliation(
+    state: FactoryAgentState,
+    visual_data: dict,
+    ocr_data: dict,
+    *,
+    registry_match: dict | None = None,
+) -> dict:
+    """Describe evidence agreement without elevating it to identity proof."""
+
+    ocr_result = _to_dict(state.get("nameplate_ocr_result", {}))
+    image_result = _to_dict(
+        state.get("image_inspection_result")
+        or state.get("vision_analysis", {})
+    )
+    image_status = image_result.get("status", "unavailable")
+    ocr_status = ocr_result.get("status", "unavailable")
+    agreements: list[dict] = []
+    missing_fields: list[dict] = []
+
+    for field, aliases in {
+        "manufacturer": (),
+        "model_number": ("model",),
+        "serial_number": ("serial",),
+    }.items():
+        visual_value = _get_value(visual_data, field, *aliases)
+        ocr_value = _get_value(ocr_data, field, *aliases)
+
+        if visual_value and ocr_value:
+            if _normalise_identifier(visual_value) == _normalise_identifier(
+                ocr_value
+            ):
+                agreements.append({
+                    "field": field,
+                    "value": _json_safe(visual_value),
+                    "sources": ["image_inspection", "nameplate_ocr"],
+                })
+            continue
+
+        missing_from = []
+
+        if not visual_value:
+            missing_from.append("image_inspection")
+
+        if not ocr_value:
+            missing_from.append("nameplate_ocr")
+
+        missing_fields.append({
+            "field": field,
+            "missing_from": missing_from,
+        })
+
+    conflicts = _record_identifier_conflicts(visual_data, ocr_data)
+    candidate = _build_registry_candidate(visual_data, ocr_data)
+    registry_match = _to_dict(registry_match or state.get("registry_match"))
+    registry_candidate = _to_dict(registry_match.get("candidate"))
+
+    registry_comparison = {
+        "status": registry_match.get("status", "not_checked"),
+        "candidate": _json_safe(registry_candidate) or None,
+        "identifier_conflicts": _json_safe(
+            registry_match.get("identifier_conflicts", [])
+        ),
+    }
+
+    if image_status == "unavailable" and ocr_status == "unavailable":
+        reconciliation_status = "evidence_unavailable"
+    elif conflicts:
+        reconciliation_status = "conflicts_detected"
+    elif image_status == "completed" and ocr_status in {
+        "text_extracted",
+        "limited_text",
+        "no_text_detected",
+    }:
+        reconciliation_status = "reconciled"
+    else:
+        reconciliation_status = "partial_evidence"
+
+    limitations: list[str] = []
+
+    if image_status != "completed":
+        limitations.append(
+            "Image inspection evidence is unavailable or incomplete."
+        )
+
+    if ocr_status not in {
+        "text_extracted",
+        "limited_text",
+        "no_text_detected",
+    }:
+        limitations.append(
+            "Nameplate OCR evidence is unavailable or incomplete."
+        )
+
+    if conflicts:
+        limitations.append(
+            "Conflicting visual and OCR identifiers require human review."
+        )
+
+    return {
+        "status": reconciliation_status,
+        "image_inspection_status": image_status,
+        "nameplate_ocr_status": ocr_status,
+        "machine_id": {
+            "value": state.get("machine_id"),
+            "source": "workflow_input",
+            "is_physical_identity_proof": False,
+        },
+        "candidate_identifiers": candidate,
+        "agreements": agreements,
+        "missing_fields": missing_fields,
+        "contradictions": conflicts,
+        "registry_comparison": registry_comparison,
+        "physical_identity_confirmed": False,
+        "requires_human_review": True,
+        "limitations": limitations,
+    }
+
+
 def _get_incident_and_task(state):
     """Retrieve the actual incident and maintenance-task objects."""
 
@@ -307,7 +432,16 @@ def _get_incident_and_task(state):
         raise ValueError("The maintenance task ID is missing.")
 
     incident = incident_service.get_incident(incident_id)
+    if incident is None:
+        incident_payload = _to_dict(state.get("incident"))
+        if incident_payload:
+            incident = incident_service.restore_incident(incident_payload)
+
     task = maintenance_service.get_task(task_id)
+    if task is None:
+        task_payload = _to_dict(state.get("maintenance_task"))
+        if task_payload:
+            task = maintenance_service.restore_task(task_payload)
 
     if incident is None:
         raise ValueError(
@@ -340,6 +474,9 @@ def _has_valid_physical_identity_confirmation(state):
     """
 
     if state.get("physical_identity_confirmed") is not True:
+        return False
+
+    if state.get("physical_identity_verification_decision") != "confirmed":
         return False
 
     if state.get("physical_verification_required") is not False:
@@ -523,6 +660,16 @@ def acquire_data(state: FactoryAgentState) -> FactoryAgentState:
     state.setdefault("sensor_readings", {})
     state.setdefault("sensor_analysis", {})
     state.setdefault("vision_analysis", {})
+    state.setdefault(
+        "image_evidence",
+        {
+            "status": "unavailable",
+            "source": "not_provided",
+        },
+    )
+    state.setdefault("image_inspection_result", {})
+    state.setdefault("nameplate_ocr_result", {})
+    state.setdefault("evidence_reconciliation", {})
     state.setdefault("equipment_identification", {})
     state.setdefault("registry_match", {})
     state.setdefault("registry_match_status", "not_checked")
@@ -539,6 +686,19 @@ def acquire_data(state: FactoryAgentState) -> FactoryAgentState:
     state.setdefault("resolved", False)
     state.setdefault("error", None)
     state.setdefault("post_maintenance_readings", {})
+    state.setdefault("incident_database_id", None)
+    state.setdefault("maintenance_task_database_id", None)
+    state.setdefault("verification_result_database_id", None)
+    state.setdefault(
+        "evolus_maintenance_assessment",
+        {
+            "status": "not_requested",
+            "assessment": None,
+            "requires_human_approval": True,
+            "safety_certified": False,
+        },
+    )
+    state.setdefault("evolus_evidence_context", {})
 
     state["status"] = "inspection_started"
 
@@ -657,10 +817,16 @@ def inspect_image(state: FactoryAgentState) -> FactoryAgentState:
     machine_id = state.get("machine_id", "unknown")
 
     if not image_path:
-        state["vision_analysis"] = {
-            "status": "skipped",
-            "reason": "No image path was provided.",
+        result = {
+            "status": "unavailable",
+            "evidence_available": False,
+            "limitations": [
+                "No image evidence was supplied to this workflow."
+            ],
+            "requires_human_review": True,
         }
+        state["image_inspection_result"] = result
+        state["vision_analysis"] = result
 
         state["equipment_identification"] = {}
 
@@ -687,9 +853,18 @@ def inspect_image(state: FactoryAgentState) -> FactoryAgentState:
                 "Image inspection returned an invalid result."
             )
 
-        state["vision_analysis"] = result_data
+        image_result = {
+            "status": "completed",
+            "evidence_available": True,
+            **result_data,
+        }
 
-        equipment = result_data.get("equipment", {})
+        state["image_inspection_result"] = image_result
+        # ``vision_analysis`` remains as a backwards-compatible alias for
+        # existing incident and simulator consumers.
+        state["vision_analysis"] = image_result
+
+        equipment = image_result.get("equipment", {})
 
         if not equipment and hasattr(result, "equipment"):
             equipment = _json_safe(_to_dict(result.equipment))
@@ -705,10 +880,18 @@ def inspect_image(state: FactoryAgentState) -> FactoryAgentState:
         )
 
     except Exception as exc:
-        state["vision_analysis"] = {
+        image_result = {
             "status": "error",
-            "error": str(exc),
+            "evidence_available": True,
+            "error_type": type(exc).__name__,
+            "limitations": [
+                "Image inspection could not be completed. The uploaded "
+                "image still requires human review."
+            ],
+            "requires_human_review": True,
         }
+        state["image_inspection_result"] = image_result
+        state["vision_analysis"] = image_result
 
         state["equipment_identification"] = {}
 
@@ -717,7 +900,7 @@ def inspect_image(state: FactoryAgentState) -> FactoryAgentState:
             {
                 "node": "inspect_image",
                 "status": "error",
-                "error": str(exc),
+                "error_type": type(exc).__name__,
             },
         )
 
@@ -725,7 +908,130 @@ def inspect_image(state: FactoryAgentState) -> FactoryAgentState:
 
 
 # ---------------------------------------------------------------------------
-# NODE 4: IDENTIFY EQUIPMENT
+# NODE 4: EXTRACT NAMEPLATE OCR
+# ---------------------------------------------------------------------------
+
+def extract_nameplate(state: FactoryAgentState) -> FactoryAgentState:
+    """Extract unverified nameplate candidates from the same image evidence."""
+
+    image_path = state.get("image_path")
+
+    if not image_path or not Path(image_path).is_file():
+        state["nameplate_ocr_result"] = {
+            "status": "unavailable",
+            "provider": None,
+            "raw_text": "",
+            "fields": {},
+            "confidence": None,
+            "requires_human_review": True,
+            "notes": [
+                "No accessible image evidence was available for nameplate OCR."
+            ],
+        }
+
+        state["messages"] = _append_message(
+            state,
+            {
+                "node": "extract_nameplate",
+                "status": "unavailable",
+            },
+        )
+
+        return state
+
+    try:
+        result = nameplate_ocr_service.inspect(str(image_path))
+        result_data = _json_safe(_to_dict(result))
+        fields = _to_dict(result_data.get("fields", {}))
+
+        state["nameplate_ocr_result"] = {
+            "status": result_data.get("status", "unknown"),
+            "provider": result_data.get("provider"),
+            "raw_text": result_data.get("raw_text", ""),
+            "fields": _json_safe(fields),
+            "confidence": result_data.get("confidence"),
+            "requires_human_review": True,
+            "notes": _json_safe(result_data.get("notes", [])),
+        }
+
+        state["messages"] = _append_message(
+            state,
+            {
+                "node": "extract_nameplate",
+                "status": state["nameplate_ocr_result"]["status"],
+                "provider": state["nameplate_ocr_result"]["provider"],
+            },
+        )
+
+    except Exception as exc:
+        state["nameplate_ocr_result"] = {
+            "status": "error",
+            "provider": None,
+            "raw_text": "",
+            "fields": {},
+            "confidence": None,
+            "requires_human_review": True,
+            "notes": [
+                "Nameplate OCR could not be completed. Review the image manually."
+            ],
+            "error_type": type(exc).__name__,
+        }
+
+        state["messages"] = _append_message(
+            state,
+            {
+                "node": "extract_nameplate",
+                "status": "error",
+                "error_type": type(exc).__name__,
+            },
+        )
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# NODE 5: RECONCILE IMAGE AND OCR EVIDENCE
+# ---------------------------------------------------------------------------
+
+def reconcile_evidence(state: FactoryAgentState) -> FactoryAgentState:
+    """Record agreements, gaps, and conflicts before registry matching."""
+
+    visual_data = _to_dict(state.get("equipment_identification", {}))
+
+    if not visual_data:
+        visual_data = _to_dict(
+            _to_dict(state.get("image_inspection_result", {})).get(
+                "equipment",
+                {},
+            )
+        )
+
+    ocr_data = _to_dict(
+        _to_dict(state.get("nameplate_ocr_result", {})).get("fields", {})
+    )
+
+    state["evidence_reconciliation"] = _build_evidence_reconciliation(
+        state,
+        visual_data,
+        ocr_data,
+    )
+
+    state["messages"] = _append_message(
+        state,
+        {
+            "node": "reconcile_evidence",
+            "status": state["evidence_reconciliation"]["status"],
+            "contradiction_count": len(
+                state["evidence_reconciliation"]["contradictions"]
+            ),
+        },
+    )
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# NODE 6: IDENTIFY EQUIPMENT
 # ---------------------------------------------------------------------------
 
 def identify_equipment(state: FactoryAgentState) -> FactoryAgentState:
@@ -736,62 +1042,20 @@ def identify_equipment(state: FactoryAgentState) -> FactoryAgentState:
     Human identity verification remains mandatory before approval.
     """
 
-    image_path = state.get("image_path")
-
     visual_data = _to_dict(
         state.get("equipment_identification", {})
     )
 
     if not visual_data:
-        vision = _to_dict(state.get("vision_analysis", {}))
+        vision = _to_dict(
+            state.get("image_inspection_result")
+            or state.get("vision_analysis", {})
+        )
         visual_data = _to_dict(vision.get("equipment", {}))
 
-    ocr_data = {}
-    ocr_status = "skipped"
-    ocr_notes = []
-
-    # OCR is attempted only when an accessible image exists.
-    if image_path and Path(image_path).is_file():
-        try:
-            result = nameplate_ocr_service.inspect(str(image_path))
-            result_data = _json_safe(_to_dict(result))
-
-            ocr_data = _to_dict(result_data.get("fields", {}))
-            ocr_status = result_data.get("status", "unknown")
-            ocr_notes = result_data.get("notes", [])
-
-            state["nameplate_ocr_result"] = {
-                "image_path": str(image_path),
-                "status": ocr_status,
-                "raw_text": result_data.get("raw_text", ""),
-                "fields": _json_safe(ocr_data),
-                "confidence": result_data.get("confidence", 0.0),
-                "requires_human_review": True,
-                "notes": _json_safe(ocr_notes),
-            }
-
-        except Exception as exc:
-            ocr_status = "error"
-            ocr_notes = [str(exc)]
-
-            state["nameplate_ocr_result"] = {
-                "image_path": str(image_path),
-                "status": "error",
-                "fields": {},
-                "requires_human_review": True,
-                "notes": ocr_notes,
-            }
-
-    else:
-        state["nameplate_ocr_result"] = {
-            "image_path": str(image_path) if image_path else None,
-            "status": "skipped",
-            "fields": {},
-            "requires_human_review": True,
-            "notes": [
-                "No accessible image file was available for OCR."
-            ],
-        }
+    ocr_result = _to_dict(state.get("nameplate_ocr_result", {}))
+    ocr_data = _to_dict(ocr_result.get("fields", {}))
+    ocr_status = ocr_result.get("status", "unavailable")
 
     visual_ocr_conflicts = _record_identifier_conflicts(
         visual_data,
@@ -847,6 +1111,12 @@ def identify_equipment(state: FactoryAgentState) -> FactoryAgentState:
 
         state["registry_match_status"] = "not_checked"
         state["registry_asset_id"] = None
+        state["evidence_reconciliation"] = _build_evidence_reconciliation(
+            state,
+            visual_data,
+            ocr_data,
+            registry_match=state["registry_match"],
+        )
 
         state["messages"] = _append_message(
             state,
@@ -954,6 +1224,12 @@ def identify_equipment(state: FactoryAgentState) -> FactoryAgentState:
 
         state["identifier_conflicts"] = registry_conflicts
         state["equipment_identifier_conflicts"] = combined_conflicts
+        state["evidence_reconciliation"] = _build_evidence_reconciliation(
+            state,
+            visual_data,
+            ocr_data,
+            registry_match=match_data,
+        )
 
         state["messages"] = _append_message(
             state,
@@ -982,21 +1258,27 @@ def identify_equipment(state: FactoryAgentState) -> FactoryAgentState:
             "physical_verification_required": True,
             "notes": [
                 "PostgreSQL equipment registry lookup failed.",
-                str(exc),
                 "Physical identity remains unverified.",
             ],
+            "error_type": type(exc).__name__,
         }
 
         state["registry_match_status"] = "error"
         state["registry_asset_id"] = None
         state["identifier_conflicts"] = []
+        state["evidence_reconciliation"] = _build_evidence_reconciliation(
+            state,
+            visual_data,
+            ocr_data,
+            registry_match=state["registry_match"],
+        )
 
         state["messages"] = _append_message(
             state,
             {
                 "node": "identify_equipment",
                 "status": "error",
-                "error": str(exc),
+                "error_type": type(exc).__name__,
             },
         )
 
@@ -1160,6 +1442,9 @@ def create_incident(state: FactoryAgentState) -> FactoryAgentState:
         state["incident"] = incident_data
         state["incident_created"] = True
         state["incident_id"] = incident_data.get("incident_id")
+        state["incident_database_id"] = (
+            workflow_artifact_store.persist_incident(incident_data)
+        )
         state["status"] = "incident_created"
         state["error"] = None
 
@@ -1180,7 +1465,191 @@ def create_incident(state: FactoryAgentState) -> FactoryAgentState:
 
 
 # ---------------------------------------------------------------------------
-# NODE 8: INVESTIGATE INCIDENT
+# NODE 8: EVOLUS DIGITAL MAINTENANCE FOREMAN
+# ---------------------------------------------------------------------------
+
+def _evolus_incident_context(state: FactoryAgentState) -> dict:
+    """Build factual, source-labelled context for Evolus.
+
+    Vision and OCR identifiers are useful investigation evidence, but are
+    candidates only. Keeping their source and verification boundary explicit
+    prevents the advisory model from treating a model reading, a registry
+    lookup, or a caller-supplied machine ID as physical identity proof.
+    """
+
+    incident = _to_dict(state.get("incident", {}))
+    image_result = _to_dict(
+        state.get("image_inspection_result") or state.get("vision_analysis")
+    )
+    ocr_result = _to_dict(state.get("nameplate_ocr_result"))
+    reconciliation = _to_dict(state.get("evidence_reconciliation"))
+    registry_match = _to_dict(state.get("registry_match"))
+
+    raw_text = ocr_result.get("raw_text")
+    if not isinstance(raw_text, str):
+        raw_text = ""
+
+    return {
+        "schema_version": "factory_inspector_evidence_context_v1",
+        "incident_id": state.get("incident_id"),
+        "equipment_id": state.get("machine_id"),
+        "severity": (
+            incident.get("severity")
+            or state.get("severity")
+            or "unknown"
+        ),
+        "simulation": True,
+        "observed_evidence": {
+            "sensor_anomalies": _json_safe(
+                _to_dict(state.get("sensor_analysis")).get("anomalies", [])
+            ),
+            "amd_vision": {
+                "source": "amd_vision_model_output",
+                "status": image_result.get("status", "unavailable"),
+                "summary": image_result.get("summary"),
+                "equipment_identification_candidate": _json_safe(
+                    _to_dict(image_result.get("equipment"))
+                ),
+                "visual_observations": _json_safe(
+                    image_result.get("observations", [])
+                ),
+                "requires_human_review": True,
+                "is_physical_identity_proof": False,
+            },
+            "nameplate_ocr": {
+                "source": "nameplate_ocr_candidate_output",
+                "status": ocr_result.get("status", "unavailable"),
+                "provider": ocr_result.get("provider"),
+                "confidence": ocr_result.get("confidence"),
+                "fields": _json_safe(_to_dict(ocr_result.get("fields"))),
+                "raw_text": raw_text[:4_000],
+                "notes": _json_safe(ocr_result.get("notes", [])),
+                "requires_human_review": True,
+                "is_physical_identity_proof": False,
+            },
+            "evidence_reconciliation": {
+                "status": reconciliation.get("status", "unavailable"),
+                "agreements": _json_safe(reconciliation.get("agreements", [])),
+                "contradictions": _json_safe(
+                    reconciliation.get("contradictions", [])
+                ),
+                "missing_fields": _json_safe(
+                    reconciliation.get("missing_fields", [])
+                ),
+                "candidate_identifiers": _json_safe(
+                    reconciliation.get("candidate_identifiers", {})
+                ),
+                "limitations": _json_safe(
+                    reconciliation.get("limitations", [])
+                ),
+            },
+        },
+        "registry_comparison": {
+            "source": "sql_equipment_registry",
+            "status": registry_match.get(
+                "status", state.get("registry_match_status", "not_checked")
+            ),
+            "candidate": _json_safe(_to_dict(registry_match.get("candidate"))),
+            "matched_identifiers": _json_safe(
+                registry_match.get("matched_identifiers", [])
+            ),
+            "identifier_conflicts": _json_safe(
+                registry_match.get("identifier_conflicts", [])
+            ),
+            "notes": _json_safe(registry_match.get("notes", [])),
+            "is_physical_identity_proof": False,
+        },
+        "identity_verification": {
+            "physical_identity_confirmed": False,
+            "physical_verification_required": True,
+            "human_review_required": True,
+        },
+        "interpretation_constraints": [
+            "Treat AMD Vision and OCR values as unverified candidate evidence.",
+            "Treat SQL registry comparison as a candidate match only, not physical identity proof.",
+            "Keep observed evidence distinct from unconfirmed diagnostic hypotheses.",
+            "Do not invent an identifier, measurement, compatible part, price, approval, or safety certification.",
+        ],
+        "safety_certified": False,
+    }
+
+
+def consult_evolus_maintenance_foreman(
+    state: FactoryAgentState,
+) -> FactoryAgentState:
+    """Get a bounded, validated advisory assessment from Evolus.
+
+    Failure does not stop incident handling: the existing evidence-based
+    maintenance task and separate human approval boundary remain authoritative.
+    """
+
+    # Preserve the exact, source-labelled input even if the advisory provider
+    # is disabled or unavailable. This makes an unavailable assessment
+    # explainable and prevents the dashboard from implying that no evidence
+    # was collected.
+    evidence_context = _evolus_incident_context(state)
+    state["evolus_evidence_context"] = _json_safe(evidence_context)
+
+    try:
+        client = EvolusClient.from_environment()
+        assessment = asyncio.run(
+            client.analyze_incident(evidence_context)
+        )
+    except EvolusConfigurationError as exc:
+        assessment = {
+            "status": "not_configured",
+            "assessment": None,
+            "requires_human_approval": True,
+            "safety_certified": False,
+            "limitations": [str(exc)],
+        }
+    except RuntimeError as exc:
+        # LangGraph currently invokes this synchronous node from FastAPI's
+        # worker thread. If future code calls it inside an event loop, fail
+        # closed rather than attempting an unsafe nested loop.
+        assessment = {
+            "status": "unavailable",
+            "assessment": None,
+            "requires_human_approval": True,
+            "safety_certified": False,
+            "limitations": [
+                "The advisory Evolus assessment could not run in this execution context."
+            ],
+            "error_type": type(exc).__name__,
+        }
+    except Exception as exc:
+        # The provider is advisory. Preserve the existing incident and human
+        # review path if an unforeseen client-side failure occurs.
+        assessment = {
+            "status": "unavailable",
+            "assessment": None,
+            "requires_human_approval": True,
+            "safety_certified": False,
+            "limitations": [
+                "The advisory Evolus assessment could not be completed."
+            ],
+            "error_type": type(exc).__name__,
+        }
+
+    # Reassert backend policy even if a malformed external response tries to
+    # describe a different approval or safety state.
+    assessment["requires_human_approval"] = True
+    assessment["safety_certified"] = False
+    state["evolus_maintenance_assessment"] = _json_safe(assessment)
+    state["messages"] = _append_message(
+        state,
+        {
+            "node": "evolus_maintenance_foreman",
+            "status": assessment.get("status", "unavailable"),
+            "requires_human_approval": True,
+        },
+    )
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# NODE 9: INVESTIGATE INCIDENT
 # ---------------------------------------------------------------------------
 
 def investigate_incident(state: FactoryAgentState) -> FactoryAgentState:
@@ -1194,6 +1663,18 @@ def investigate_incident(state: FactoryAgentState) -> FactoryAgentState:
         ),
         "vision_analysis": _json_safe(
             state.get("vision_analysis", {})
+        ),
+        "image_evidence": _json_safe(
+            state.get("image_evidence", {})
+        ),
+        "image_inspection_result": _json_safe(
+            state.get("image_inspection_result", {})
+        ),
+        "nameplate_ocr_result": _json_safe(
+            state.get("nameplate_ocr_result", {})
+        ),
+        "evidence_reconciliation": _json_safe(
+            state.get("evidence_reconciliation", {})
         ),
         "equipment_identification": _json_safe(
             state.get("equipment_identification", {})
@@ -1220,6 +1701,12 @@ def investigate_incident(state: FactoryAgentState) -> FactoryAgentState:
         "incident_details": _json_safe(
             state.get("incident", {})
         ),
+        "evolus_maintenance_assessment": _json_safe(
+            state.get("evolus_maintenance_assessment", {})
+        ),
+        "evolus_evidence_context": _json_safe(
+            state.get("evolus_evidence_context", {})
+        ),
         "requires_human_review": True,
         "physical_identity_confirmed": False,
     }
@@ -1236,7 +1723,7 @@ def investigate_incident(state: FactoryAgentState) -> FactoryAgentState:
 
 
 # ---------------------------------------------------------------------------
-# NODE 9: GENERATE MAINTENANCE TASK
+# NODE 10: GENERATE MAINTENANCE TASK
 # ---------------------------------------------------------------------------
 
 def generate_maintenance_task(
@@ -1257,6 +1744,10 @@ def generate_maintenance_task(
             )
 
         incident = incident_service.get_incident(incident_id)
+        if incident is None:
+            incident = incident_service.restore_incident(
+                _to_dict(state.get("incident"))
+            )
 
         if incident is None:
             raise ValueError(
@@ -1285,6 +1776,9 @@ def generate_maintenance_task(
         )
 
         task_data["proposed_actions"] = proposed_actions
+        task_data["evolus_maintenance_assessment"] = _json_safe(
+            state.get("evolus_maintenance_assessment", {})
+        )
 
         state["incident"] = _json_safe(_to_dict(incident))
         state["maintenance_task"] = task_data
@@ -1292,6 +1786,12 @@ def generate_maintenance_task(
         state["maintenance_task_description"] = task.problem
         state["maintenance_status"] = _task_status_value(task)
         state["action_plan"] = proposed_actions
+        state["maintenance_task_database_id"] = (
+            workflow_artifact_store.persist_task(
+                task_data,
+                incident_database_id=state.get("incident_database_id"),
+            )
+        )
 
         state["requires_human_approval"] = True
         state["approval_status"] = "pending"
@@ -1316,7 +1816,7 @@ def generate_maintenance_task(
 
 
 # ---------------------------------------------------------------------------
-# NODE 10: PROCESS HUMAN APPROVAL
+# NODE 11: PROCESS HUMAN APPROVAL
 # ---------------------------------------------------------------------------
 
 def process_approval(state: FactoryAgentState) -> FactoryAgentState:
@@ -1342,6 +1842,10 @@ def process_approval(state: FactoryAgentState) -> FactoryAgentState:
         )
 
     task = maintenance_service.get_task(task_id)
+    if task is None:
+        task = maintenance_service.restore_task(
+            _to_dict(state.get("maintenance_task"))
+        )
 
     if task is None:
         return _error(
@@ -1375,6 +1879,9 @@ def process_approval(state: FactoryAgentState) -> FactoryAgentState:
             "maintenance_task_id": str(task_id),
             "maintenance_task": _json_safe(task_payload),
             "proposed_actions": _json_safe(proposed_actions),
+            "evolus_maintenance_assessment": _json_safe(
+                state.get("evolus_maintenance_assessment", {})
+            ),
             "registry_match": _json_safe(
                 state.get("registry_match") or {}
             ),
@@ -1486,6 +1993,9 @@ def process_approval(state: FactoryAgentState) -> FactoryAgentState:
             f"Could not update maintenance task '{task_id}'.",
         )
 
+    # The decision was just recorded. Keep this presentation field aligned
+    # with the separate approval state; it does not relax any execution gate.
+    updated_task.requires_human_approval = False
     updated_task_payload = _serialize_task(updated_task)
     updated_task_payload["proposed_actions"] = _json_safe(
         proposed_actions
@@ -1498,6 +2008,14 @@ def process_approval(state: FactoryAgentState) -> FactoryAgentState:
     state["approval_comment"] = str(approval_comment)
     state["requires_human_approval"] = False
     state["error"] = None
+    state["maintenance_task_database_id"] = (
+        workflow_artifact_store.persist_task(
+            updated_task_payload,
+            incident_database_id=state.get("incident_database_id"),
+            approval_user=approval_user,
+            approval_comment=str(approval_comment),
+        )
+    )
 
     if approval_status == "approved":
         state["status"] = "maintenance_approved"
@@ -1567,6 +2085,10 @@ def start_maintenance(state: FactoryAgentState) -> FactoryAgentState:
 
     try:
         task = maintenance_service.get_task(task_id)
+        if task is None:
+            task = maintenance_service.restore_task(
+                _to_dict(state.get("maintenance_task"))
+            )
 
         if task is None:
             raise ValueError(
@@ -1590,6 +2112,12 @@ def start_maintenance(state: FactoryAgentState) -> FactoryAgentState:
 
         state["maintenance_task"] = _serialize_task(task)
         state["maintenance_status"] = _task_status_value(task)
+        state["maintenance_task_database_id"] = (
+            workflow_artifact_store.persist_task(
+                state["maintenance_task"],
+                incident_database_id=state.get("incident_database_id"),
+            )
+        )
         state["status"] = "maintenance_in_progress"
         state["error"] = None
 
@@ -1664,6 +2192,10 @@ def complete_maintenance(state: FactoryAgentState) -> FactoryAgentState:
         scenario = get_scenario(scenario_id) if scenario_id else None
 
         task = maintenance_service.get_task(task_id)
+        if task is None:
+            task = maintenance_service.restore_task(
+                _to_dict(state.get("maintenance_task"))
+            )
 
         if task is None:
             raise ValueError(
@@ -1691,6 +2223,12 @@ def complete_maintenance(state: FactoryAgentState) -> FactoryAgentState:
         # Always update both the nested task and top-level task status.
         state["maintenance_task"] = _serialize_task(task)
         state["maintenance_status"] = _task_status_value(task)
+        state["maintenance_task_database_id"] = (
+            workflow_artifact_store.persist_task(
+                state["maintenance_task"],
+                incident_database_id=state.get("incident_database_id"),
+            )
+        )
 
         if scenario:
             if scenario.get("maintenance_will_resolve") is True:
@@ -1803,11 +2341,21 @@ def verify_maintenance(state: FactoryAgentState) -> FactoryAgentState:
         state["verification_result"] = {
             **result_data,
             "outcome": outcome,
+            "resolved": resolved,
             "evidence_simulated": True,
             "safety_certified": False,
         }
 
         state["resolved"] = resolved
+        state["verification_result_database_id"] = (
+            workflow_artifact_store.persist_verification(
+                state["verification_result"],
+                incident_database_id=state.get("incident_database_id"),
+                maintenance_task_database_id=state.get(
+                    "maintenance_task_database_id"
+                ),
+            )
+        )
         state["status"] = (
             "verification_completed"
             if resolved
@@ -1884,16 +2432,35 @@ def close_incident(state: FactoryAgentState) -> FactoryAgentState:
             )
 
         incident = incident_service.get_incident(incident_id)
+        if incident is None:
+            incident = incident_service.restore_incident(
+                _to_dict(state.get("incident"))
+            )
 
         if incident is None:
             raise ValueError(
                 f"Incident '{incident_id}' could not be retrieved."
             )
 
-        incident_service.update_status(
+        resolved_incident = incident_service.update_status(
             incident_id,
             IncidentStatus.RESOLVED,
         )
+
+        # The service updates the in-memory Incident object. Refresh the
+        # serialized graph state as well so API responses do not continue to
+        # show the pre-closure "open" status.
+        incident_data = _json_safe(_to_dict(resolved_incident))
+        state["incident"] = incident_data
+        workflow_artifact_store.resolve_incident(
+            state.get("incident_database_id"),
+            str(_to_dict(state.get("verification_result")).get("summary") or ""),
+        )
+
+        investigation = _to_dict(state.get("investigation"))
+        if investigation:
+            investigation["incident_details"] = incident_data
+            state["investigation"] = investigation
 
         state["status"] = "incident_resolved"
         state["error"] = None

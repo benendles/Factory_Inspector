@@ -5,6 +5,7 @@ pydantic-settings
 python-dotenv
 openai
 langgraph
+langgraph-checkpoint-postgres
 httpx
 pytest
 python-multipart

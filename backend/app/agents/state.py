@@ -27,6 +27,13 @@ class FactoryAgentState(TypedDict, total=False):
     sensor_analysis: dict[str, Any]
     vision_analysis: dict[str, Any]
 
+    # Public metadata about submitted inspection evidence. ``image_path`` is
+    # an internal, short-lived processing path and must not be returned.
+    image_evidence: dict[str, Any]
+    image_inspection_result: dict[str, Any]
+    nameplate_ocr_result: dict[str, Any]
+    evidence_reconciliation: dict[str, Any]
+
     # Nodes store detected anomaly records in this field.
     anomalies_detected: list[dict[str, Any]] | bool
     severity: str
@@ -69,6 +76,16 @@ class FactoryAgentState(TypedDict, total=False):
     incident_id: str
     incident: dict[str, Any]
     incident_created: bool
+    # IDs of durable records created for this workflow. They are separate
+    # from the human-readable incident/task identifiers above.
+    incident_database_id: str | None
+
+    # Advisory output from the external Evolus Digital Maintenance Foreman.
+    # This is never an approval, work order state, or safety certification.
+    evolus_maintenance_assessment: dict[str, Any]
+    # Evidence supplied to Evolus for auditability and dashboard display.
+    # This contains observations/candidates, never a physical identity claim.
+    evolus_evidence_context: dict[str, Any]
 
     # 6. Investigation and maintenance planning
 
@@ -76,7 +93,11 @@ class FactoryAgentState(TypedDict, total=False):
     action_plan: list[dict[str, Any]]
 
     maintenance_task_id: str
+    maintenance_task_database_id: str | None
+    maintenance_task: dict[str, Any]
+    maintenance_task_description: str
     maintenance_status: str
+    repair_plan: dict[str, Any]
 
     # 7. Human approval
 
@@ -95,6 +116,7 @@ class FactoryAgentState(TypedDict, total=False):
 
     post_maintenance_readings: dict[str, Any]
     verification_result: dict[str, Any]
+    verification_result_database_id: str | None
     resolved: bool
 
     # 9. Workflow control

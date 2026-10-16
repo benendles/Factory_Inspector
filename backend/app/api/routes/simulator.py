@@ -1,9 +1,13 @@
 """API endpoints for the Factory Inspector simulator and agent workflow."""
 
+import os
+import tempfile
 from typing import Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
+from fastapi.concurrency import run_in_threadpool
+from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 
 from app.services.factory_workflow_service import (
@@ -20,6 +24,84 @@ router = APIRouter(
     prefix="/simulator",
     tags=["Factory Simulator"],
 )
+
+MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024
+ALLOWED_IMAGE_MEDIA_TYPES = {
+    "image/jpeg": (".jpg", "JPEG"),
+    "image/png": (".png", "PNG"),
+    "image/webp": (".webp", "WEBP"),
+}
+
+
+async def _store_validated_workflow_image(
+    image: UploadFile,
+) -> tuple[str, dict[str, Any]]:
+    """Store one validated image temporarily for the synchronous workflow run."""
+
+    content_type = (image.content_type or "").lower()
+    allowed = ALLOWED_IMAGE_MEDIA_TYPES.get(content_type)
+
+    if allowed is None:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Upload a JPEG, PNG, or WEBP inspection image.",
+        )
+
+    content = await image.read(MAX_IMAGE_UPLOAD_BYTES + 1)
+
+    if not content:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="The inspection image is empty.",
+        )
+
+    if len(content) > MAX_IMAGE_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail="The inspection image exceeds the 10 MiB size limit.",
+        )
+
+    suffix, expected_format = allowed
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix="factory-inspector-evidence-",
+        suffix=suffix,
+    )
+
+    try:
+        with os.fdopen(descriptor, "wb") as temporary_file:
+            temporary_file.write(content)
+
+        try:
+            with Image.open(temporary_path) as uploaded_image:
+                actual_format = uploaded_image.format
+                uploaded_image.verify()
+        except (UnidentifiedImageError, OSError, ValueError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="The uploaded file is not a readable image.",
+            ) from exc
+
+        if actual_format != expected_format:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="The uploaded content does not match its image type.",
+            )
+
+        return temporary_path, {
+            "status": "available",
+            "source": "uploaded_image",
+            "content_type": content_type,
+            "size_bytes": len(content),
+        }
+
+    except Exception:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        await image.close()
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +213,43 @@ def start_factory_workflow(request: WorkflowStartRequest):
             status_code=500,
             detail="Could not start the factory workflow.",
         ) from exc
+
+
+@router.post("/workflow/with-image", status_code=200)
+async def start_factory_workflow_with_image(
+    scenario_id: str = Form(..., min_length=1, max_length=100),
+    machine_id: str = Form(..., min_length=1, max_length=100),
+    image: UploadFile = File(...),
+):
+    """Start the existing workflow using one validated inspection image."""
+
+    temporary_path, image_evidence = await _store_validated_workflow_image(
+        image
+    )
+
+    try:
+        # The LangGraph workflow and its provider clients are synchronous.
+        # Keeping them off this async request handler's event loop also lets
+        # the Evolus advisory node safely run its bounded async client.
+        return await run_in_threadpool(
+            factory_workflow_service.start_workflow,
+            scenario_id=scenario_id,
+            machine_id=machine_id,
+            image_path=temporary_path,
+            image_evidence=image_evidence,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not start the factory workflow with image evidence.",
+        ) from exc
+    finally:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
 
 
 @router.get("/workflow/{thread_id}")

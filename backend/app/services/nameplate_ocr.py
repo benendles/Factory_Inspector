@@ -1,6 +1,7 @@
 import os
 import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
@@ -35,10 +36,30 @@ class NameplateOCRResult(BaseModel):
     image_path: str
     raw_text: str
     fields: NameplateFields
+    provider: str
     status: IdentificationStatus
     confidence: float = Field(ge=0.0, le=100.0)
     requires_human_review: bool = True
     notes: list[str] = Field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _TesseractCandidate:
+    """One OCR pass over a preprocessing and segmentation combination."""
+
+    text: str
+    confidence: float
+    fields: NameplateFields
+    useful_characters: int
+    variant_index: int
+    config_index: int
+
+    @property
+    def populated_field_count(self) -> int:
+        return sum(
+            getattr(self.fields, field_name) is not None
+            for field_name in NameplateFields.model_fields
+        )
 
 
 class NameplateOCRService:
@@ -68,6 +89,9 @@ class NameplateOCRService:
         "--oem 3 --psm 4",
         "--oem 3 --psm 12",
     ]
+    # A richer result can win only when it is close enough to the most
+    # confident result to remain credible. OCR output is always unverified.
+    RICHER_RESULT_CONFIDENCE_DELTA = 12.0
 
     def __init__(
         self,
@@ -201,25 +225,156 @@ class NameplateOCRService:
     def _best_tesseract_result(
         cls,
         image: Image.Image,
-    ) -> tuple[str, float]:
-        """Try several preprocessing and segmentation combinations."""
-        best_text = ""
-        best_confidence = 0.0
-        best_score = float("-inf")
+    ) -> tuple[str, float, list[str]]:
+        """Select one credible, information-rich Tesseract OCR result.
 
-        for variant in cls._preprocess_variants(image):
-            for config in cls.OCR_CONFIGS:
+        Every preprocessing and page-segmentation combination is evaluated
+        independently. A candidate with more recognizable nameplate fields
+        can win only when its mean confidence is reasonably close to the
+        highest-confidence result. Fields from separate OCR runs are never
+        merged into the selected result.
+        """
+        candidates: list[_TesseractCandidate] = []
+
+        for variant_index, variant in enumerate(cls._preprocess_variants(image)):
+            for config_index, config in enumerate(cls.OCR_CONFIGS):
                 text, confidence = cls._run_tesseract(variant, config)
 
-                useful_characters = sum(char.isalnum() for char in text)
-                score = confidence + min(useful_characters, 200) * 0.03
+                if not text:
+                    continue
 
-                if text and score > best_score:
-                    best_text = text
-                    best_confidence = confidence
-                    best_score = score
+                candidates.append(
+                    _TesseractCandidate(
+                        text=text,
+                        confidence=confidence,
+                        fields=cls._parse_fields(text),
+                        useful_characters=sum(
+                            char.isalnum() for char in text
+                        ),
+                        variant_index=variant_index,
+                        config_index=config_index,
+                    )
+                )
 
-        return best_text, best_confidence
+        if not candidates:
+            return "", 0.0, []
+
+        highest_confidence = max(
+            candidate.confidence for candidate in candidates
+        )
+        comparable_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.confidence
+            >= highest_confidence - cls.RICHER_RESULT_CONFIDENCE_DELTA
+        ]
+
+        # The final tie-breakers make results stable when OCR evidence is
+        # otherwise equivalent. Negative indexes preserve first-run order.
+        selected = max(
+            comparable_candidates,
+            key=lambda candidate: (
+                candidate.populated_field_count,
+                candidate.confidence,
+                candidate.useful_characters,
+                -candidate.variant_index,
+                -candidate.config_index,
+            ),
+        )
+
+        return (
+            selected.text,
+            selected.confidence,
+            cls._candidate_conflict_notes(candidates),
+        )
+
+    @staticmethod
+    def _normalized_candidate_value(value: str) -> str:
+        """Normalize a parsed OCR value solely for candidate comparison."""
+        normalized = " ".join(value.upper().replace(",", ".").split())
+        return re.sub(r"[\s_:/-]+", "", normalized)
+
+    @classmethod
+    def _is_plausible_conflict_candidate(
+        cls,
+        field_name: str,
+        value: str,
+    ) -> bool:
+        """Keep obvious OCR noise out of cross-configuration warnings.
+
+        This affects only which values are compared for a conflict note. It
+        does not upgrade any OCR value, alter the selected raw text, or merge
+        results from separate OCR configurations.
+        """
+        candidate = value.strip()
+
+        if not candidate or "\n" in candidate or "\r" in candidate:
+            return False
+
+        if field_name == "model_number":
+            compact = cls._normalized_candidate_value(candidate)
+            return len(compact) >= 4
+
+        measurement_patterns = {
+            "voltage": (
+                r"\d+(?:[.,]\d+)?(?:[ \t]*/[ \t]*\d+(?:[.,]\d+)?)*"
+                r"[ \t]*(?:VAC|VDC|KV|V)"
+            ),
+            "power": r"\d+(?:[.,]\d+)?[ \t]*(?:KW|W|HP|MW)",
+            "frequency": r"\d+(?:[.,]\d+)?[ \t]*HZ",
+            "current": (
+                r"\d+(?:[.,]\d+)?(?:[ \t]*/[ \t]*\d+(?:[.,]\d+)?)*"
+                r"[ \t]*A"
+            ),
+            "speed_rpm": r"\d{3,5}[ \t]*(?:RPM|R/MIN)",
+            "power_factor": r"(?:0?\.\d+|1(?:\.0+)?)",
+        }
+        pattern = measurement_patterns.get(field_name)
+
+        return pattern is None or bool(
+            re.fullmatch(pattern, candidate, flags=re.IGNORECASE)
+        )
+
+    @classmethod
+    def _candidate_conflict_notes(
+        cls,
+        candidates: list[_TesseractCandidate],
+    ) -> list[str]:
+        """Describe conflicting field candidates without resolving them."""
+        field_values: dict[str, dict[str, str]] = {
+            field_name: {}
+            for field_name in NameplateFields.model_fields
+        }
+
+        for candidate in candidates:
+            for field_name in NameplateFields.model_fields:
+                value = getattr(candidate.fields, field_name)
+
+                if value is None:
+                    continue
+
+                if not cls._is_plausible_conflict_candidate(
+                    field_name,
+                    value,
+                ):
+                    continue
+
+                normalized = cls._normalized_candidate_value(value)
+                field_values[field_name].setdefault(normalized, value)
+
+        notes: list[str] = []
+
+        for field_name in NameplateFields.model_fields:
+            values = list(field_values[field_name].values())
+
+            if len(values) > 1:
+                notes.append(
+                    "OCR configurations produced conflicting "
+                    f"{field_name} candidates: {', '.join(values)}. "
+                    "Review the original nameplate; no value is verified."
+                )
+
+        return notes
 
     def _run_google_vision(
         self,
@@ -281,10 +436,12 @@ class NameplateOCRService:
                 r"^\s*(?:manufacturer|mfr|make|brand)\s+(.{2,80})$",
             ],
             "model_number": [
-                r"^\s*(?:model|model\s*(?:no|number|#)|type)\s*[:#=-]\s*([A-Z0-9][A-Z0-9./_-]{1,50})\s*$",
+                r"^\s*(?:model(?:\s*(?:no\.?|number|#))?|type)\s*[:#=-]?\s+([A-Z0-9][A-Z0-9./_-]{1,50})\s*$",
+                r"^\s*(?:model(?:\s*(?:no\.?|number|#))?|type)\s*[:#=-]\s*([A-Z0-9][A-Z0-9./_-]{1,50})\s*$",
             ],
             "serial_number": [
-                r"^\s*(?:serial(?:\s*(?:no|number|#))?|s/?n)\s*[:#=-]\s*([A-Z0-9][A-Z0-9./_-]{1,50})\s*$",
+                r"^\s*(?:serial(?:\s*(?:no\.?|number|#))?|s[/\\]?n|sin)\s*[:#=-]?\s+([A-Z0-9][A-Z0-9./_-]{1,50})\s*$",
+                r"^\s*(?:serial(?:\s*(?:no\.?|number|#))?|s[/\\]?n|sin)\s*[:#=-]\s*([A-Z0-9][A-Z0-9./_-]{1,50})\s*$",
             ],
             "voltage": [
                 r"^\s*(?:rated\s*)?(?:voltage|volt|volts|u)\s*[:= -]\s*([0-9.,/ -]+\s*(?:VAC|VDC|KV|V)?)\s*$",
@@ -341,6 +498,24 @@ class NameplateOCRService:
             if values[field] is None:
                 values[field] = cls._extract_field(text, patterns)
 
+        # Recognize a limited set of known manufacturer names when they
+        # appear as standalone text. This remains an OCR candidate, not
+        # verified equipment identity.
+        if values["manufacturer"] is None:
+            known_manufacturers = {
+                "SIEMENS",
+                "ABB",
+                "WEG",
+                "SCHNEIDER ELECTRIC",
+                "SEW EURODRIVE",
+                "NIDEC",
+            }
+            for line in text.splitlines():
+                normalized = line.strip().upper().strip(" .,:;")
+                if normalized in known_manufacturers:
+                    values["manufacturer"] = normalized
+                    break
+
         return NameplateFields(**values)
 
     def inspect(self, image_path: str | Path) -> NameplateOCRResult:
@@ -370,6 +545,7 @@ class NameplateOCRService:
             ) from exc
 
         notes: list[str] = []
+        selection_notes: list[str] = []
         provider_used: str
 
         # Try Google Vision first unless Tesseract was explicitly requested.
@@ -391,15 +567,19 @@ class NameplateOCRService:
                     ) from exc
 
                 notes.append(
-                    "Google Cloud Vision failed; Tesseract fallback was used. "
-                    f"Reason: {exc}"
+                    "Google Cloud Vision failed; Tesseract fallback was used "
+                    f"({type(exc).__name__})."
                 )
-                raw_text, confidence = self._best_tesseract_result(image)
+                raw_text, confidence, selection_notes = (
+                    self._best_tesseract_result(image)
+                )
                 provider_used = "tesseract_fallback"
 
         else:
             try:
-                raw_text, confidence = self._best_tesseract_result(image)
+                raw_text, confidence, selection_notes = (
+                    self._best_tesseract_result(image)
+                )
                 provider_used = "tesseract"
             except pytesseract.TesseractNotFoundError as exc:
                 raise RuntimeError(
@@ -410,6 +590,7 @@ class NameplateOCRService:
                 raise RuntimeError(f"Tesseract OCR failed: {exc}") from exc
 
         fields = self._parse_fields(raw_text)
+        notes.extend(selection_notes)
 
         if not raw_text.strip():
             status: IdentificationStatus = "no_text_detected"
@@ -470,6 +651,7 @@ class NameplateOCRService:
             image_path=str(path),
             raw_text=raw_text,
             fields=fields,
+            provider=provider_used,
             status=status,
             confidence=round(confidence, 2),
             requires_human_review=True,

@@ -10,6 +10,11 @@ from app.database.models import Equipment
 from app.database.session import SessionLocal
 
 
+@unittest.skipUnless(
+    os.getenv("RUN_EXTERNAL_DATABASE_TESTS", "").strip().casefold()
+    in {"1", "true", "yes"},
+    "Requires an explicitly enabled, reachable PostgreSQL/Supabase database.",
+)
 class TestEquipmentPersistence(unittest.TestCase):
     """Verify that equipment can be stored and retrieved."""
 

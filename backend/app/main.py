@@ -14,13 +14,17 @@ from app.api.routes.health import router as health_router
 from app.api.routes.simulator import router as simulator_router
 from app.config import settings
 from app.database.session import engine
+from app.services.factory_workflow_service import factory_workflow_service
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application startup and shutdown."""
-    yield
-    engine.dispose()
+    try:
+        yield
+    finally:
+        factory_workflow_service.close()
+        engine.dispose()
 
 
 app = FastAPI(

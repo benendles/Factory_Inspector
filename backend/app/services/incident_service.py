@@ -231,7 +231,7 @@ class IncidentService:
                 )
                 existing.visual_evidence = visual
                 existing.sensor_evidence = sensors
-                existing.severity = self._get_severity(visual, sensors)
+                existing.severity = self._get_severity(sensors, visual)
                 existing.description = self._build_description(visual, sensors)
                 existing.title = self._build_title(visual, sensors)
                 return existing
@@ -255,6 +255,46 @@ class IncidentService:
         """Retrieve an incident by ID."""
 
         return self._incidents.get(incident_id)
+
+    def restore_incident(self, payload: dict[str, Any]) -> Incident:
+        """Rehydrate a checkpointed incident after an application reload.
+
+        The LangGraph checkpoint is durable, while this service deliberately
+        keeps a small in-process cache for node ergonomics. Restoring from a
+        checkpoint never creates a new incident or changes its lifecycle.
+        """
+
+        incident_id = str(payload.get("incident_id") or "")
+        if not incident_id:
+            raise ValueError("Cannot restore an incident without incident_id.")
+
+        existing = self._incidents.get(incident_id)
+        if existing is not None:
+            return existing
+
+        try:
+            severity = IncidentSeverity(str(payload.get("severity") or "low"))
+            status = IncidentStatus(str(payload.get("status") or "open"))
+        except ValueError as exc:
+            raise ValueError("Checkpointed incident has an invalid lifecycle value.") from exc
+
+        incident = Incident(
+            incident_id=incident_id,
+            machine_id=str(payload.get("machine_id") or ""),
+            title=str(payload.get("title") or "Factory inspection requires review"),
+            description=str(payload.get("description") or ""),
+            severity=severity,
+            status=status,
+            visual_evidence=list(payload.get("visual_evidence") or []),
+            sensor_evidence=list(payload.get("sensor_evidence") or []),
+            requires_human_review=bool(
+                payload.get("requires_human_review", True)
+            ),
+            created_at=str(payload.get("created_at") or datetime.now(timezone.utc).isoformat()),
+            updated_at=str(payload.get("updated_at") or datetime.now(timezone.utc).isoformat()),
+        )
+        self._incidents[incident_id] = incident
+        return incident
 
     def list_incidents(self) -> list[Incident]:
         """Return all incidents, newest first."""

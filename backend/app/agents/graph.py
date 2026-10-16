@@ -30,10 +30,16 @@ def build_factory_graph(checkpointer=None):
     workflow.add_node("acquire_data", nodes.acquire_data)
     workflow.add_node("analyze_sensors", nodes.analyze_sensors)
     workflow.add_node("inspect_image", nodes.inspect_image)
+    workflow.add_node("extract_nameplate", nodes.extract_nameplate)
+    workflow.add_node("reconcile_evidence", nodes.reconcile_evidence)
     workflow.add_node("identify_equipment", nodes.identify_equipment)
     workflow.add_node("triage_incident", nodes.triage_incident)
     workflow.add_node("log_normal_operation", nodes.log_normal_operation)
     workflow.add_node("create_incident", nodes.create_incident)
+    workflow.add_node(
+        "evolus_maintenance_foreman",
+        nodes.consult_evolus_maintenance_foreman,
+    )
     workflow.add_node("investigate_incident", nodes.investigate_incident)
     workflow.add_node(
         "generate_maintenance_task",
@@ -70,16 +76,19 @@ def build_factory_graph(checkpointer=None):
         },
     )
 
-    # Inspect the image, then identify the equipment.
+    # Inspect one image, extract its nameplate, reconcile the unverified
+    # evidence, then perform conservative registry matching.
     workflow.add_conditional_edges(
         "inspect_image",
         route_after_image_inspection,
         {
-            "triage_incident": "identify_equipment",
+            "extract_nameplate": "extract_nameplate",
             "error": "handle_error",
         },
     )
 
+    workflow.add_edge("extract_nameplate", "reconcile_evidence")
+    workflow.add_edge("reconcile_evidence", "identify_equipment")
     workflow.add_edge("identify_equipment", "triage_incident")
 
     # Triage findings.
@@ -100,9 +109,16 @@ def build_factory_graph(checkpointer=None):
         "create_incident",
         route_after_incident_creation,
         {
-            "investigate_incident": "investigate_incident",
+            "investigate_incident": "evolus_maintenance_foreman",
             "error": "handle_error",
         },
+    )
+
+    # Evolus is advisory only. A failed/invalid response is recorded in state
+    # and the evidence-based workflow continues to human review.
+    workflow.add_edge(
+        "evolus_maintenance_foreman",
+        "investigate_incident",
     )
 
     workflow.add_conditional_edges(

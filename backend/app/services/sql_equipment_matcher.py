@@ -237,15 +237,30 @@ class SQLEquipmentMatcher:
             )
 
             if candidate is not None:
-                # Check any additional observed strong identifiers against
-                # this candidate. A mismatch is a conflict, not permission
-                # to ignore the disagreeing identifier.
-                for key, observed_value in strong_observed.items():
+                # Strong identifiers choose a candidate, but every supplied
+                # registry-comparable identifier is relevant when explaining
+                # whether that candidate conflicts with the observation.
+                # The order is deliberate so API responses are deterministic.
+                for key in (
+                    "manufacturer",
+                    "model_number",
+                    "serial_number",
+                    "asset_tag",
+                    "machine_id",
+                ):
+                    observed_value = observed[key]
+
+                    if observed_value is None:
+                        continue
+
                     registry_value = normalize_identifier(
                         _value(candidate, key)
                     )
 
-                    if registry_value and registry_value != observed_value:
+                    if (
+                        registry_value is not None
+                        and registry_value != observed_value
+                    ):
                         conflicts.append(
                             f"Observed {key} conflicts with the candidate."
                         )

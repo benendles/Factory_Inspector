@@ -38,12 +38,12 @@ def route_after_sensor_analysis(
 def route_after_image_inspection(
     state: FactoryAgentState,
 ) -> str:
-    """Triage evidence, or stop if image inspection failed."""
+    """Continue to OCR even when visual inspection is unavailable."""
 
     if state.get("status") == "error" or state.get("error"):
         return "error"
 
-    return "triage_incident"
+    return "extract_nameplate"
 
 
 # =========================================================
